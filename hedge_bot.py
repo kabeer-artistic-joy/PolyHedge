@@ -275,6 +275,8 @@ class HedgeBot:
         self.bot_name = os.getenv("BOT_NAME", "hedge_bot")
         self.mode_str = "dry_run" if dry_run else "live"
         self.stop_event = threading.Event()
+        self.trades = []
+        self.trades_lock = threading.Lock()
         self.logger = TradeLogger()
         self.client = None
         if not dry_run:
@@ -716,6 +718,8 @@ class HedgeBot:
                 "up_target_price": round(up_bid + SELL_TARGET_PER_SHARE, 4),
                 **outcome,
             }
+            with self.trades_lock:
+                self.trades.append(row)
             self.logger.write(row)
             sign = "+" if outcome["pnl_usd"] >= 0 else ""
             log(f"RECORDED: {outcome['outcome']} | pnl={sign}${outcome['pnl_usd']}", crypto)
@@ -753,6 +757,31 @@ class HedgeBot:
         except KeyboardInterrupt:
             log("Stopping...")
             self.stop_event.set()
+            self._print_summary()
+
+    def _print_summary(self):
+        with self.trades_lock:
+            trades = list(self.trades)
+        if not trades:
+            log("No completed entries this session.")
+            return
+        both_hit = [t for t in trades if t["outcome"] == "both_hit"]
+        early_cut = [t for t in trades if t["outcome"] == "target_and_early_cut"]
+        one_hit_resolved = [t for t in trades if t["outcome"] == "one_hit_other_resolved"]
+        neutral = [t for t in trades if t["outcome"] == "neutral_resolve"]
+        total_pnl = sum(float(t["pnl_usd"]) for t in trades)
+        wins = [t for t in trades if float(t["pnl_usd"]) > 0]
+        losses = [t for t in trades if float(t["pnl_usd"]) < 0]
+
+        log("-" * 70)
+        log(f"SUMMARY — {len(trades)} completed entries")
+        log(f"  Both legs hit target: {len(both_hit)}")
+        log(f"  One target + one early stop-loss cut: {len(early_cut)}")
+        log(f"  One hit, other rode to resolution (no stop-loss triggered): {len(one_hit_resolved)}")
+        log(f"  Neutral resolve (neither hit, a wash): {len(neutral)}")
+        log(f"  Wins: {len(wins)} | Losses: {len(losses)}")
+        log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+        log("-" * 70)
 
 
 if __name__ == "__main__":
