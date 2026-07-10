@@ -76,6 +76,39 @@ MAX_ENTRIES_PER_WINDOW = 4      # cap, not a mandate — depends on real conditi
 MONITOR_INTERVAL = 1.0
 POLL_INTERVAL_LEG = 0.5         # how often to check each resting sell leg for a fill
 
+# ─── CTF (Conditional Token Framework) CONSTANTS ────────────────────────────
+# Verified against Polymarket's official documentation
+# (github.com/Polymarket/agent-skills/blob/main/ctf-operations.md) — split is a
+# DIRECT SMART CONTRACT CALL, not a py_clob_client_v2 / CLOB API method.
+POLYGON_RPC = "https://polygon-rpc.com"
+CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+PARENT_COLLECTION_ID = "0x" + "00" * 32  # always bytes32(0) for Polymarket markets
+BINARY_PARTITION = [1, 2]  # Yes=1, No=2 (Up=1, Down=2 for these markets)
+
+# Minimal ABIs — only the functions actually needed
+CTF_ABI = [
+    {
+        "name": "splitPosition", "type": "function", "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "partition", "type": "uint256[]"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+]
+ERC20_ABI = [
+    {"name": "approve", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+     "outputs": [{"name": "", "type": "bool"}]},
+    {"name": "allowance", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+     "outputs": [{"name": "", "type": "uint256"}]},
+]
+
 # ─── UTILITIES (proven patterns, reused from breakthrough_bot.py) ───────────
 _print_lock = threading.Lock()
 
@@ -177,12 +210,18 @@ class PriceHistory:
     def choppiness_ratio(self):
         """path_length / net_displacement over the lookback window.
         High ratio = genuine back-and-forth churn. Low ratio (near 1) =
-        a clean, mostly-monotonic directional move. Returns None if not
-        enough history yet."""
+        a clean, mostly-monotonic directional move. Returns None if we
+        don't yet have a FULL window_seconds of real elapsed history —
+        REAL GAP FIXED HERE: previously only required 3 samples to exist,
+        which could compute a misleading ratio off a few seconds of data
+        early in a window, not the genuine full-window read intended."""
         with self.lock:
             if len(self.samples) < 3:
                 return None
             now = now_unix()
+            oldest_sample_time = self.samples[0][0]
+            if now - oldest_sample_time < self.window_seconds:
+                return None  # not enough REAL elapsed time yet, regardless of sample count
             in_window = [(t, p) for t, p in self.samples if t >= now - self.window_seconds]
             if len(in_window) < 3:
                 return None
@@ -239,9 +278,6 @@ class HedgeBot:
         log("=" * 70)
 
     def _init_client(self):
-        # NOTE: standard CLOB client for placing the resting sell orders.
-        # The SPLIT call itself is a separate, CTF-level operation — see
-        # _split_position below, which needs live verification.
         from py_clob_client_v2 import ClobClient, AssetType, BalanceAllowanceParams
         signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "3"))
         self.client = ClobClient(
@@ -252,6 +288,50 @@ class HedgeBot:
         self.client.update_balance_allowance(BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL, signature_type=signature_type,
         ))
+
+        # Split is a direct smart-contract call (CTF), not a CLOB API method —
+        # confirmed against Polymarket's official agent-skills documentation.
+        # Needs its own web3 connection and its own USDC.e approval separate
+        # from the CLOB's own allowance system.
+        from web3 import Web3
+        self.w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+        self.wallet_address = Web3.to_checksum_address(os.environ["POLY_PROXY_WALLET"])
+        self.ctf_contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS), abi=CTF_ABI)
+        self.usdc_contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=ERC20_ABI)
+        self._ensure_ctf_approval()
+
+    def _ensure_ctf_approval(self):
+        """The CTF contract needs approval to spend USDC.e before split will
+        work — confirmed as a prerequisite in Polymarket's own docs. Checks
+        the real on-chain allowance first; only sends an approval transaction
+        if actually needed, rather than approving on every startup."""
+        try:
+            current_allowance = self.usdc_contract.functions.allowance(
+                self.wallet_address, Web3.to_checksum_address(CTF_CONTRACT_ADDRESS)
+            ).call()
+            if current_allowance > 10**12:  # already generously approved
+                log("CTF contract already approved to spend USDC.e — skipping approval tx")
+                return
+            log("⚠️ CTF contract not yet approved for USDC.e — sending approval transaction "
+                "(one-time, small gas cost on Polygon)")
+            max_uint = 2**256 - 1
+            approve_tx = self.usdc_contract.functions.approve(
+                Web3.to_checksum_address(CTF_CONTRACT_ADDRESS), max_uint
+            ).build_transaction({
+                "from": self.wallet_address,
+                "nonce": self.w3.eth.get_transaction_count(self.wallet_address),
+                "gas": 100000,
+                "gasPrice": self.w3.eth.gas_price,
+            })
+            signed = self.w3.eth.account.sign_transaction(approve_tx, private_key=os.environ["POLY_PRIVATE_KEY"])
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            log(f"Approval tx sent: {tx_hash.hex()} — waiting for confirmation...")
+            self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            log("CTF approval confirmed")
+        except Exception as e:
+            log(f"⚠️ Could not verify/send CTF approval ({e}) — split will likely fail until this is resolved")
 
     # ── ENTRY SIGNAL ─────────────────────────────────────────────────────────
     def _should_enter(self, delta_from_beat: float, choppiness) -> bool:
@@ -265,16 +345,37 @@ class HedgeBot:
     def _split_position(self, condition_id: str, amount: float) -> dict:
         """Mints `amount` shares of BOTH Up and Down via the CTF split
         operation. Fixed conversion: $1 always -> 1 Up share + 1 Down share,
-        regardless of current market odds."""
+        regardless of current market odds. Verified against Polymarket's
+        official CTF documentation — this is a direct call to splitPosition
+        on the CTF contract, not a CLOB order."""
         if self.dry_run:
             # Split always succeeds at the fixed rate in reality — no order-book
             # risk to simulate here, unlike a normal buy.
             return {"result": "split", "shares": amount}
-        # NOTE: exact CTF split call needs verification against a real account —
-        # this is a smart-contract-level operation, not a standard CLOB order.
         try:
-            resp = self.client.split_position(condition_id=condition_id, amount=amount)
-            return {"result": "split", "shares": amount, "tx": resp}
+            from web3 import Web3
+            amount_units = int(round(amount * 1_000_000))  # USDC.e uses 6 decimals
+            condition_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+            tx = self.ctf_contract.functions.splitPosition(
+                Web3.to_checksum_address(USDC_E_ADDRESS),
+                bytes.fromhex(PARENT_COLLECTION_ID.replace("0x", "")),
+                condition_id_bytes,
+                BINARY_PARTITION,
+                amount_units,
+            ).build_transaction({
+                "from": self.wallet_address,
+                "nonce": self.w3.eth.get_transaction_count(self.wallet_address),
+                "gas": 300000,
+                "gasPrice": self.w3.eth.gas_price,
+            })
+            signed = self.w3.eth.account.sign_transaction(tx, private_key=os.environ["POLY_PRIVATE_KEY"])
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+            if receipt.status != 1:
+                log(f"⚠️ Split transaction reverted: {tx_hash.hex()}")
+                return {"result": "error", "shares": 0}
+            log(f"Split confirmed: {tx_hash.hex()}")
+            return {"result": "split", "shares": amount, "tx": tx_hash.hex()}
         except Exception as e:
             log(f"⚠️ Split failed: {e}")
             return {"result": "error", "shares": 0}
