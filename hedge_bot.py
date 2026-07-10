@@ -67,6 +67,18 @@ SELL_TARGET_PER_SHARE = 0.05    # sell target above each leg's entry price
 MAX_DELTA_TO_ENTER = 10.0       # skip entirely if |BTC price - price-to-beat| exceeds this —
                                   # a strong persistent trend is the outcome-B danger zone
 
+STOP_LOSS_DELTA_THRESHOLD = 15.0  # IN-TRADE danger signal, wider than the entry filter (10) since
+                                     # some drift is tolerated once already in a position. If |delta|
+                                     # crosses this while one leg is still unsold, cut that leg early
+                                     # at best available price instead of risking the full loss at
+                                     # resolution. Confirmed against real data: both real losses so
+                                     # far showed a delta that was already sizeable at entry and kept
+                                     # strengthening the whole time the losing leg sat unsold — same
+                                     # starting-guess status as CHOPPINESS_RATIO_THRESHOLD, meant to
+                                     # be refined against real dry-run data, not assumed correct.
+STOP_LOSS_POLL_INTERVAL = 0.5      # how often to check delta once a position is open, tighter than
+                                     # the entry-scanning interval since this is now risk-monitoring
+
 CHOPPINESS_LOOKBACK_SEC = 45    # rolling window for the churn-detection signal
 CHOPPINESS_RATIO_THRESHOLD = 2.5  # path_length / net_displacement must exceed this to enter —
                                      # starting guess, meant to be refined against real dry-run data,
@@ -382,7 +394,8 @@ class HedgeBot:
 
     # ── HEDGE MONITORING ─────────────────────────────────────────────────────
     def _place_and_monitor_hedge(self, market: dict, shares: float,
-                                   down_entry: float, up_entry: float, close_ts: float) -> dict:
+                                   down_entry: float, up_entry: float, close_ts: float,
+                                   window_open_price: float, symbol: str) -> dict:
         down_target = round(down_entry + SELL_TARGET_PER_SHARE, 4)
         up_target = round(up_entry + SELL_TARGET_PER_SHARE, 4)
         log(f"Hedge entered: {shares} Down @ ${down_entry} (target ${down_target}) | "
@@ -390,6 +403,7 @@ class HedgeBot:
 
         down_sold = up_sold = False
         down_exit = up_exit = None
+        down_cut_early = up_cut_early = False
 
         if not self.dry_run:
             from py_clob_client_v2 import OrderArgsV2, Side, OrderType
@@ -441,6 +455,38 @@ class HedgeBot:
                             log(f"Up leg filled at ${up_target}", market["crypto"])
                     except Exception:
                         pass
+
+            # IN-TRADE STOP-LOSS: if BTC has moved hard enough away from
+            # price-to-beat, the losing leg is unlikely to recover. Cut it
+            # early at best available price rather than risk the full loss
+            # at resolution. Only applies to whichever leg is STILL unsold
+            # and is the one actually at risk given the direction of the move.
+            current_price = get_binance_price(symbol) if symbol else None
+            if current_price is not None and window_open_price:
+                live_delta = current_price - window_open_price
+                if live_delta <= -STOP_LOSS_DELTA_THRESHOLD and not up_sold and not up_cut_early:
+                    log(f"⚠️ Delta {live_delta:+.2f} crossed -{STOP_LOSS_DELTA_THRESHOLD} — "
+                        f"Up leg looks unlikely to recover, cutting early", market["crypto"])
+                    up_exit = self._cut_loss_early(market["up_token"], shares, market["crypto"])
+                    up_sold, up_cut_early = True, True
+                    if not self.dry_run and up_order_id:
+                        from py_clob_client_v2 import OrderPayload
+                        try:
+                            self.client.cancel_order(OrderPayload(orderID=up_order_id))
+                        except Exception:
+                            pass
+                elif live_delta >= STOP_LOSS_DELTA_THRESHOLD and not down_sold and not down_cut_early:
+                    log(f"⚠️ Delta {live_delta:+.2f} crossed +{STOP_LOSS_DELTA_THRESHOLD} — "
+                        f"Down leg looks unlikely to recover, cutting early", market["crypto"])
+                    down_exit = self._cut_loss_early(market["down_token"], shares, market["crypto"])
+                    down_sold, down_cut_early = True, True
+                    if not self.dry_run and down_order_id:
+                        from py_clob_client_v2 import OrderPayload
+                        try:
+                            self.client.cancel_order(OrderPayload(orderID=down_order_id))
+                        except Exception:
+                            pass
+
             time.sleep(POLL_INTERVAL_LEG)
 
         # Window closing — cancel whichever resting order(s) never filled,
@@ -459,28 +505,112 @@ class HedgeBot:
                     pass
 
         return self._resolve_outcome(market, shares, down_entry, up_entry,
-                                       down_sold, down_exit, up_sold, up_exit)
+                                       down_sold, down_exit, up_sold, up_exit,
+                                       down_cut_early, up_cut_early)
+
+    def _cut_loss_early(self, token: str, shares: float, crypto: str) -> float:
+        """Sells the given leg at best available price right now, rather than
+        risk it resolving to $0. In dry-run, simulates the SAME
+        detect-then-execute delay that causes real slippage on the original
+        bot, instead of assuming a perfect instant fill — same fix applied
+        there after real data showed overshoot up to $0.26."""
+        if self.dry_run:
+            time.sleep(0.6)  # approximates real detect-then-submit execution delay
+            book = get_order_book(token)
+            bid, _ = best_bid(book)
+            if bid is None:
+                log(f"[DRY] No bids at all for early cut-loss — simulating a total loss on this leg", crypto)
+                return 0.0
+            log(f"[DRY] Early cut-loss would fill at ${bid:.3f} (after simulated execution delay)", crypto)
+            return bid
+        # LIVE: reuse the same escalating market-then-limit-sell approach
+        # proven on the original bot, rather than a single fragile attempt.
+        from py_clob_client_v2 import MarketOrderArgsV2, OrderArgsV2, Side, OrderType, OrderPayload
+        try:
+            resp = self.client.create_and_post_market_order(
+                MarketOrderArgsV2(token_id=token, amount=shares, side=Side.SELL),
+                order_type=OrderType.FAK,
+            )
+            status = str(resp.get("status", "")).lower()
+            if status == "matched":
+                try:
+                    proceeds = float(resp.get("takingAmount", 0))  # plain USDC amount, not scaled
+                    price = round(proceeds / shares, 4) if shares else None
+                    if price is not None and 0.01 <= price < 1:
+                        return price
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"⚠️ Market sell for early cut-loss failed ({e}) — escalating to limit sell", crypto)
+
+        # Market attempt failed or gave an unparseable price — escalate
+        # through increasingly aggressive limit prices, same pattern as
+        # the original bot's guaranteed-sell mechanism.
+        for factor in (0.85, 0.70, 0.50, 0.30, 0.15, 0.05, 0.01):
+            book = get_order_book(token)
+            current_bid, _ = best_bid(book)
+            reference = current_bid if current_bid is not None else 0.5
+            price = max(round(reference * factor, 2), 0.01) if factor > 0.01 else 0.01
+            try:
+                resp = self.client.create_and_post_order(
+                    OrderArgsV2(token_id=token, price=price, size=shares, side=Side.SELL),
+                    order_type=OrderType.GTC)
+                order_id = resp.get("orderID", "")
+            except Exception:
+                continue
+            deadline = now_unix() + 1.5
+            while now_unix() < deadline:
+                try:
+                    detail = self.client.get_order(order_id)
+                    if float(detail.get("size_matched", 0)) >= shares:
+                        return price
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            try:
+                self.client.cancel_order(OrderPayload(orderID=order_id))
+            except Exception:
+                pass
+        log(f"⚠️ Could not cut loss early even at the exchange floor — will resolve at settlement", crypto)
+        return None  # genuinely couldn't sell — falls back to normal resolution math
 
     def _resolve_outcome(self, market, shares, down_entry, up_entry,
-                          down_sold, down_exit, up_sold, up_exit):
+                          down_sold, down_exit, up_sold, up_exit,
+                          down_cut_early=False, up_cut_early=False):
         total_cost = shares * down_entry + shares * up_entry  # for a real split this simplifies to
                                                                  # $amount total, kept explicit for clarity
+
+        # Edge case: a cut-early attempt can itself fail to find any buyer
+        # (returns None from _cut_loss_early) — treat that leg as genuinely
+        # unsold, falling through to normal resolution, not a phantom sale.
+        if down_cut_early and down_exit is None:
+            down_sold, down_cut_early = False, False
+        if up_cut_early and up_exit is None:
+            up_sold, up_cut_early = False, False
+
         if down_sold and up_sold:
             proceeds = shares * down_exit + shares * up_exit
             pnl = round(proceeds - total_cost, 4)
+            if down_cut_early or up_cut_early:
+                cut_side = "Down" if down_cut_early else "Up"
+                return {"outcome": "target_and_early_cut", "pnl_usd": pnl,
+                        "down_result": "cut_early" if down_cut_early else "sold",
+                        "up_result": "cut_early" if up_cut_early else "sold",
+                        "down_exit_price": down_exit, "up_exit_price": up_exit,
+                        "notes": f"one leg hit target, {cut_side} cut early by the delta stop-loss "
+                                 f"instead of riding to full resolution"}
             return {"outcome": "both_hit", "pnl_usd": pnl, "down_result": "sold", "up_result": "sold",
                     "down_exit_price": down_exit, "up_exit_price": up_exit,
                     "notes": "both legs hit their target"}
 
-        # Exactly one (or neither) leg sold — need to know which side actually
-        # WON the window to know if the unsold leg resolves to $0 or $1.
+        # Neither leg sold (via target OR early cut) — need to know which
+        # side actually WON the window to know how the unsold leg(s) resolve.
         symbol = SYMBOLS.get(market["crypto"])
         window_open = get_window_open_price(symbol, market["start_ts"])
         final_price = get_binance_price(symbol)
         up_won = (final_price is not None and window_open is not None and final_price > window_open)
 
         if not down_sold and not up_sold:
-            # Outcome C: neither ever hit target — clean resolve, a wash.
             proceeds = shares * (1.0 if up_won else 0.0) + shares * (0.0 if up_won else 1.0)
             pnl = round(proceeds - total_cost, 4)
             return {"outcome": "neutral_resolve", "pnl_usd": pnl,
@@ -489,27 +619,27 @@ class HedgeBot:
                     "down_exit_price": 1.0 if not up_won else 0.0, "up_exit_price": 1.0 if up_won else 0.0,
                     "notes": "neither leg hit target — resolved normally, a wash"}
 
-        # Outcome B: exactly one leg sold, the other rides to resolution
+        # Exactly one leg sold (target hit, since we already excluded the
+        # early-cut-succeeded case above via the down_sold/up_sold check),
+        # the other rides to resolution with no stop-loss ever engaging.
         if down_sold:
-            # Holding the remaining UP shares -- they resolve based on
-            # whether Up actually won, not its inverse.
             other_resolve = 1.0 if up_won else 0.0
             proceeds = shares * down_exit + shares * other_resolve
             pnl = round(proceeds - total_cost, 4)
             return {"outcome": "one_hit_other_resolved", "pnl_usd": pnl,
                     "down_result": "sold", "up_result": "resolved",
                     "down_exit_price": down_exit, "up_exit_price": other_resolve,
-                    "notes": f"Down sold at target, Up resolved to ${other_resolve} at settlement"}
+                    "notes": f"Down sold at target, Up resolved to ${other_resolve} at settlement "
+                             f"(delta never crossed the stop-loss threshold)"}
         else:
-            # Holding the remaining DOWN shares -- they resolve based on
-            # whether Down actually won (the inverse of up_won).
             other_resolve = 0.0 if up_won else 1.0
             proceeds = shares * up_exit + shares * other_resolve
             pnl = round(proceeds - total_cost, 4)
             return {"outcome": "one_hit_other_resolved", "pnl_usd": pnl,
                     "down_result": "resolved", "up_result": "sold",
                     "down_exit_price": other_resolve, "up_exit_price": up_exit,
-                    "notes": f"Up sold at target, Down resolved to ${other_resolve} at settlement"}
+                    "notes": f"Up sold at target, Down resolved to ${other_resolve} at settlement "
+                             f"(delta never crossed the stop-loss threshold)"}
 
     # ── WINDOW LOOP ──────────────────────────────────────────────────────────
     def _monitor_window(self, slug_prefix: str, start_ts: int):
@@ -573,7 +703,8 @@ class HedgeBot:
                 continue
 
             shares = split_result["shares"]
-            outcome = self._place_and_monitor_hedge(market, shares, down_bid, up_bid, close_ts)
+            outcome = self._place_and_monitor_hedge(market, shares, down_bid, up_bid, close_ts,
+                                                       window_open_price, symbol)
 
             row = {
                 "timestamp": ts_str(), "mode": self.mode_str, "crypto": crypto, "slug": market["slug"],
