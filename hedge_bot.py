@@ -93,9 +93,12 @@ POLL_INTERVAL_LEG = 0.5         # how often to check each resting sell leg for a
 # bounded risk control instead of relying purely on the entry being right.
 SINGLE_SIDE_AMOUNT_USD = 10.0
 SINGLE_SIDE_TARGET = 0.02        # sell target above the real entry price
-SINGLE_SIDE_STOP_LOSS = 0.05     # stop-loss distance below entry — sell at best available price
-                                    # (accepting slippage) once crossed, same philosophy as the
-                                    # original bot's proven guaranteed-exit mechanism
+SINGLE_SIDE_STOP_LOSS = 0.15     # stop-loss distance below entry — raised from 0.05, was too tight —
+                                    # sell at best available price (accepting slippage) once crossed,
+                                    # same philosophy as the original bot's proven guaranteed-exit mechanism
+OBSERVATION_WINDOW_SEC = 5.0      # after identifying the coin-flip lean, watch it for this long before
+                                    # committing — only enter if the leaning side's price is STILL moving
+                                    # the same direction at the end of the window, not just static or reversed
 SINGLE_SIDE_POLL_INTERVAL = 0.15 # tight polling — same reasoning as the original bot's stop-loss
                                     # tightening: every second of detection delay is real overshoot risk
 SINGLE_SIDE_BUY_CEILING_BUFFER = 0.02  # willing to pay up to (observed price + this) to get filled
@@ -310,7 +313,8 @@ class HedgeBot:
             log(f"Leaning-side | ${SINGLE_SIDE_AMOUNT_USD}/entry | "
                 f"target +${SINGLE_SIDE_TARGET} | stop-loss -${SINGLE_SIDE_STOP_LOSS} | "
                 f"max {MAX_ENTRIES_PER_WINDOW} entry/window")
-            log(f"Entry: at coin-flip, buy whichever side is already priced higher (the market's own lean)")
+            log(f"Entry: at coin-flip, identify the leaning side, observe {OBSERVATION_WINDOW_SEC}s, "
+                f"only enter if the lean is still moving the same direction")
         else:
             log(f"Split-Hedge | ${amount:.2f}/entry | coin_flip_mode={COIN_FLIP_MODE}")
             log(f"Sell target: entry price + ${SELL_TARGET_PER_SHARE}/share on EACH leg | no stop-loss")
@@ -841,14 +845,46 @@ class HedgeBot:
             return
 
         if down_ask > up_ask:
-            side_to_enter, token, observed_price = "Down", market["down_token"], down_ask
+            side_to_enter, token = "Down", market["down_token"]
+            baseline_price = down_ask
         elif up_ask > down_ask:
-            side_to_enter, token, observed_price = "Up", market["up_token"], up_ask
+            side_to_enter, token = "Up", market["up_token"]
+            baseline_price = up_ask
         else:
             log(f"Coin-flip exactly even (Down=${down_ask}, Up=${up_ask}) — no lean to act on, skipping", crypto)
             return
 
-        log(f"Coin-flip lean: Down ${down_ask} | Up ${up_ask} -> buying {side_to_enter} @ ~${observed_price}", crypto)
+        log(f"Coin-flip lean: Down ${down_ask} | Up ${up_ask} -> {side_to_enter} leaning, "
+            f"observing for {OBSERVATION_WINDOW_SEC}s to confirm before entering", crypto)
+
+        # Watch the leaning side for OBSERVATION_WINDOW_SEC — only commit if
+        # its price is STILL moving the same direction at the end, not just
+        # static or already reversing back. This directly targets the
+        # pattern found in real data: many losses had the winning leg jump
+        # almost instantly, suggesting a fast, real move, not noise — but a
+        # coin-flip lean that reverses within a few seconds is more likely
+        # to have been noise in the first place.
+        observation_deadline = now_unix() + OBSERVATION_WINDOW_SEC
+        while now_unix() < observation_deadline:
+            if self.stop_event.is_set():
+                return
+            time.sleep(0.2)
+
+        book_check = get_order_book(token)
+        current_ask, _ = best_ask(book_check)
+        if current_ask is None:
+            log("Could not re-check price after observation window — skipping", crypto)
+            return
+
+        if current_ask <= baseline_price:
+            log(f"Not confirmed: {side_to_enter} was ${baseline_price}, now ${current_ask} — "
+                f"did not continue in the same direction, skipping this window", crypto)
+            return
+
+        observed_price = current_ask
+        log(f"Confirmed: {side_to_enter} moved from ${baseline_price} to ${observed_price} "
+            f"(still the same direction) -> entering", crypto)
+
         buy_result = self._attempt_single_buy(token, observed_price, crypto)
         row = {
             "timestamp": ts_str(), "mode": self.mode_str, "crypto": crypto, "slug": market["slug"],
