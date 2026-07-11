@@ -61,24 +61,45 @@ BINANCE_API = "https://api.binance.com"
 SYMBOLS = {"BTC": "BTCUSDT"}
 MARKETS = {"btc-updown-5m": "BTC"}
 
-SPLIT_AMOUNT_USD = 10.0         # $ split into equal Up+Down shares per entry — raised from $2 for this test
-SELL_TARGET_PER_SHARE = 0.02    # sell target above each leg's entry price — tightened from $0.05 for this test
+STRATEGY_MODE = "leaning_side"  # "split" (the hedge strategy, both legs) or
+                                  # "leaning_side" (new: at coin-flip, buy whichever side is
+                                  # ALREADY priced higher — the market's own immediate lean —
+                                  # with a real stop-loss this time). Both implementations are
+                                  # kept intact below — switching this back to "split" returns
+                                  # to exactly the previously-tested behavior.
 
-COIN_FLIP_MODE = True          # NEW TEST VARIANT: enter immediately at window start, skipping the
+SPLIT_AMOUNT_USD = 10.0         # $ split into equal Up+Down shares per entry (split mode only)
+SELL_TARGET_PER_SHARE = 0.02    # sell target above each leg's entry price (split mode only)
+
+COIN_FLIP_MODE = True          # split mode only: enter immediately at window start, skipping the
                                   # choppiness/delta signal entirely. Set to False to go back to the
                                   # gated-entry approach (kept intact below, not deleted, for comparison).
 
-MAX_DELTA_TO_ENTER = 10.0       # only used when COIN_FLIP_MODE is False — skip entirely if
+MAX_DELTA_TO_ENTER = 10.0       # split mode only, when COIN_FLIP_MODE is False — skip entirely if
                                   # |BTC price - price-to-beat| exceeds this
 
-CHOPPINESS_LOOKBACK_SEC = 45    # only used when COIN_FLIP_MODE is False — rolling window for the
-                                  # churn-detection signal
-CHOPPINESS_RATIO_THRESHOLD = 2.5  # only used when COIN_FLIP_MODE is False
+CHOPPINESS_LOOKBACK_SEC = 45    # split mode only, when COIN_FLIP_MODE is False — rolling window for
+                                  # the churn-detection signal
+CHOPPINESS_RATIO_THRESHOLD = 2.5  # split mode only, when COIN_FLIP_MODE is False
 
-MAX_ENTRIES_PER_WINDOW = 1      # lowered from 4 — one coin-flip entry per window, wait the full
-                                  # window, no re-entries for this test
+MAX_ENTRIES_PER_WINDOW = 1      # one entry per window, wait the full window, no re-entries
 MONITOR_INTERVAL = 1.0
-POLL_INTERVAL_LEG = 0.5         # how often to check each resting sell leg for a fill
+POLL_INTERVAL_LEG = 0.5         # how often to check each resting sell leg for a fill (split mode)
+
+# ─── LEANING-SIDE STRATEGY CONFIG ───────────────────────────────────────────
+# At window start, buy whichever side (Up or Down) is already priced higher —
+# the market's own immediate lean, right at the coin-flip moment. Explicit
+# stop-loss this time (unlike the previous single-sided attempt): a real,
+# bounded risk control instead of relying purely on the entry being right.
+SINGLE_SIDE_AMOUNT_USD = 10.0
+SINGLE_SIDE_TARGET = 0.02        # sell target above the real entry price
+SINGLE_SIDE_STOP_LOSS = 0.05     # stop-loss distance below entry — sell at best available price
+                                    # (accepting slippage) once crossed, same philosophy as the
+                                    # original bot's proven guaranteed-exit mechanism
+SINGLE_SIDE_POLL_INTERVAL = 0.15 # tight polling — same reasoning as the original bot's stop-loss
+                                    # tightening: every second of detection delay is real overshoot risk
+SINGLE_SIDE_BUY_CEILING_BUFFER = 0.02  # willing to pay up to (observed price + this) to get filled
+SINGLE_SIDE_BUY_TIMEOUT_SEC = 2.0
 
 # ─── CTF (Conditional Token Framework) CONSTANTS ────────────────────────────
 # Verified against Polymarket's official documentation
@@ -187,6 +208,13 @@ def get_order_book(token_id: str) -> dict:
     except Exception:
         return {}
 
+def best_ask(book: dict):
+    asks = book.get("asks", [])
+    if not asks:
+        return None, None
+    cheapest = min(asks, key=lambda a: float(a["price"]))
+    return float(cheapest["price"]), float(cheapest["size"])
+
 def best_bid(book: dict):
     bids = book.get("bids", [])
     if not bids:
@@ -242,6 +270,8 @@ CSV_FIELDS = [
     "down_entry_price", "up_entry_price", "shares_per_leg", "total_cost",
     "down_target_price", "up_target_price",
     "down_result", "down_exit_price", "up_result", "up_exit_price",
+    # leaning_side mode columns
+    "side", "buy_result", "entry_price", "shares", "exit_price",
     "outcome", "pnl_usd", "notes",
 ]
 
@@ -275,11 +305,16 @@ class HedgeBot:
             self._init_client()
 
         log("=" * 70)
-        log(f"Split-Hedge Scalper | {self.mode_str.upper()} | ${amount:.2f}/entry | bot_name={self.bot_name}")
-        log(f"Entry gate: |delta from price-to-beat| < ${MAX_DELTA_TO_ENTER} AND "
-            f"choppiness ratio > {CHOPPINESS_RATIO_THRESHOLD} over {CHOPPINESS_LOOKBACK_SEC}s")
-        log(f"Sell target: entry price + ${SELL_TARGET_PER_SHARE}/share on EACH leg | no stop-loss")
-        log(f"Max {MAX_ENTRIES_PER_WINDOW} entries/window (not mandatory)")
+        log(f"Strategy Mode: {STRATEGY_MODE} | {self.mode_str.upper()} | bot_name={self.bot_name}")
+        if STRATEGY_MODE == "leaning_side":
+            log(f"Leaning-side | ${SINGLE_SIDE_AMOUNT_USD}/entry | "
+                f"target +${SINGLE_SIDE_TARGET} | stop-loss -${SINGLE_SIDE_STOP_LOSS} | "
+                f"max {MAX_ENTRIES_PER_WINDOW} entry/window")
+            log(f"Entry: at coin-flip, buy whichever side is already priced higher (the market's own lean)")
+        else:
+            log(f"Split-Hedge | ${amount:.2f}/entry | coin_flip_mode={COIN_FLIP_MODE}")
+            log(f"Sell target: entry price + ${SELL_TARGET_PER_SHARE}/share on EACH leg | no stop-loss")
+            log(f"Max {MAX_ENTRIES_PER_WINDOW} entries/window (not mandatory)")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -298,15 +333,17 @@ class HedgeBot:
         # Split is a direct smart-contract call (CTF), not a CLOB API method —
         # confirmed against Polymarket's official agent-skills documentation.
         # Needs its own web3 connection and its own USDC.e approval separate
-        # from the CLOB's own allowance system.
-        from web3 import Web3
-        self.w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-        self.wallet_address = Web3.to_checksum_address(os.environ["POLY_PROXY_WALLET"])
-        self.ctf_contract = self.w3.eth.contract(
-            address=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS), abi=CTF_ABI)
-        self.usdc_contract = self.w3.eth.contract(
-            address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=ERC20_ABI)
-        self._ensure_ctf_approval()
+        # from the CLOB's own allowance system. Only needed in split mode —
+        # leaning_side never calls split, so skip this entirely there.
+        if STRATEGY_MODE == "split":
+            from web3 import Web3
+            self.w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            self.wallet_address = Web3.to_checksum_address(os.environ["POLY_PROXY_WALLET"])
+            self.ctf_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS), abi=CTF_ABI)
+            self.usdc_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=ERC20_ABI)
+            self._ensure_ctf_approval()
 
     def _ensure_ctf_approval(self):
         """The CTF contract needs approval to spend USDC.e before split will
@@ -387,6 +424,256 @@ class HedgeBot:
         except Exception as e:
             log(f"⚠️ Split failed: {e}")
             return {"result": "error", "shares": 0}
+
+    # ── SINGLE-SIDED BUY (leaning_side mode only) ────────────────────
+    def _attempt_single_buy(self, token: str, observed_price: float, crypto: str) -> dict:
+        """Regular CLOB buy for ONE side — no atomicity concern here since
+        there's no second leg to keep in sync, so this doesn't need the
+        split mechanism at all. Reuses the proven buy-then-verify-real-balance
+        pattern from the original bot, including the fix for understated
+        fills from timing gaps between polling and the real on-chain state."""
+        MIN_SHARES = 5  # confirmed exchange minimum, same constraint as the original bot
+        ceiling = round(observed_price + SINGLE_SIDE_BUY_CEILING_BUFFER, 4)
+        size = max(MIN_SHARES, round(SINGLE_SIDE_AMOUNT_USD / ceiling))
+
+        if self.dry_run:
+            book = get_order_book(token)
+            price, book_size = best_ask(book)
+            if price is not None and price <= ceiling:
+                log(f"[DRY] BUY would fill: ask ${price:.3f} (size {book_size})", crypto)
+                return {"result": "bought", "price": price, "shares": size}
+            log(f"[DRY] BUY missed: no ask <= ${ceiling}", crypto)
+            return {"result": "missed", "price": None, "shares": 0}
+
+        from py_clob_client_v2 import OrderArgsV2, Side, OrderType, OrderPayload, AssetType, BalanceAllowanceParams
+        balance_before = 0.0
+        try:
+            bal_resp_before = self.client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token,
+                signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
+            ))
+            balance_before = float(bal_resp_before.get("balance", 0)) / 1_000_000
+        except Exception as e:
+            log(f"⚠️ Could not check balance before buying ({e}) — proceeding", crypto)
+
+        try:
+            resp = self.client.create_and_post_order(
+                OrderArgsV2(token_id=token, price=ceiling, size=size, side=Side.BUY),
+                order_type=OrderType.GTC,
+            )
+        except Exception as e:
+            log(f"❌ BUY order failed to submit: {e}", crypto)
+            return {"result": "error", "price": None, "shares": 0}
+
+        order_id = resp.get("orderID", "")
+        deadline = now_unix() + SINGLE_SIDE_BUY_TIMEOUT_SEC
+        last_known_size = 0.0
+        while now_unix() < deadline:
+            try:
+                detail = self.client.get_order(order_id)
+                current_size = float(detail.get("size_matched", 0))
+                if current_size > last_known_size:
+                    last_known_size = current_size
+            except Exception:
+                pass
+            time.sleep(0.25)
+        try:
+            self.client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception:
+            pass
+
+        final_shares = last_known_size
+        try:
+            bal_resp_after = self.client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token,
+                signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
+            ))
+            real_balance_after = float(bal_resp_after.get("balance", 0)) / 1_000_000
+            delta = round(real_balance_after - balance_before, 4)
+            if delta > final_shares:
+                final_shares = min(delta, size)  # never trust more than what was actually intended
+        except Exception as e:
+            log(f"⚠️ Balance verification failed ({e}) — proceeding with tracked fill amount", crypto)
+
+        if final_shares <= 0:
+            log(f"❌ BUY timed out with no confirmed fill after {SINGLE_SIDE_BUY_TIMEOUT_SEC}s", crypto)
+            return {"result": "missed", "price": None, "shares": 0}
+        log(f"✅ BUY confirmed: {final_shares} shares at ceiling ${ceiling}", crypto)
+        return {"result": "bought", "price": ceiling, "shares": final_shares}
+
+    def _guaranteed_sell(self, token: str, shares: float, crypto: str, max_market_attempts: int = 2) -> dict:
+        """Sells the given shares NO MATTER WHAT, accepting slippage — ported
+        directly from the original bot's proven stop-loss exit mechanism.
+        Tries a real market sell a couple times first, then escalates through
+        increasingly aggressive limit prices all the way to the exchange's
+        actual minimum ($0.01) before ever giving up, so a position is never
+        left unsold and unprotected."""
+        if self.dry_run:
+            time.sleep(0.6)  # approximates the real detect-then-submit execution delay
+            book = get_order_book(token)
+            bid, _ = best_bid(book)
+            if bid is None:
+                log("[DRY] No bids at all for stop-loss exit — worst case this leg", crypto)
+                return {"price": None}
+            log(f"[DRY] Stop-loss would fill at ${bid:.3f} (after simulated execution delay)", crypto)
+            return {"price": bid}
+
+        from py_clob_client_v2 import MarketOrderArgsV2, OrderArgsV2, Side, OrderType, OrderPayload
+        for attempt in range(1, max_market_attempts + 1):
+            try:
+                resp = self.client.create_and_post_market_order(
+                    MarketOrderArgsV2(token_id=token, amount=shares, side=Side.SELL),
+                    order_type=OrderType.FAK,
+                )
+                status = str(resp.get("status", "")).lower()
+                if status == "matched":
+                    try:
+                        proceeds = float(resp.get("takingAmount", 0))  # plain USDC amount, not scaled
+                        price = round(proceeds / shares, 4) if shares else None
+                        if price is not None and 0.01 <= price < 1:
+                            return {"price": price}
+                    except Exception:
+                        pass
+                    return {"price": None}  # matched but couldn't parse a trustworthy price
+                log(f"⚠️ Market sell attempt {attempt}/{max_market_attempts}: status={status}, retrying...", crypto)
+            except Exception as e:
+                log(f"⚠️ Market sell attempt {attempt}/{max_market_attempts} failed: {e}", crypto)
+            if attempt < max_market_attempts:
+                time.sleep(0.3)
+
+        # Escalate through increasingly aggressive limit prices down to the
+        # exchange's actual floor ($0.01) — same proven pattern as the
+        # original bot's guaranteed exit.
+        for factor in (0.85, 0.70, 0.50, 0.30, 0.15, 0.05, 0.01):
+            book = get_order_book(token)
+            current_bid, _ = best_bid(book)
+            reference = current_bid if current_bid is not None else 0.5
+            price = max(round(reference * factor, 2), 0.01) if factor > 0.01 else 0.01
+            try:
+                resp = self.client.create_and_post_order(
+                    OrderArgsV2(token_id=token, price=price, size=shares, side=Side.SELL),
+                    order_type=OrderType.GTC)
+                order_id = resp.get("orderID", "")
+            except Exception:
+                continue
+            deadline = now_unix() + 1.5
+            while now_unix() < deadline:
+                try:
+                    detail = self.client.get_order(order_id)
+                    if float(detail.get("size_matched", 0)) >= shares:
+                        return {"price": price}
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            try:
+                self.client.cancel_order(OrderPayload(orderID=order_id))
+            except Exception:
+                pass
+        log("⚠️ Could not sell even at the exchange floor — position remains open, will settle at resolution", crypto)
+        return {"price": None}
+
+    def _monitor_single_position(self, side: str, token: str, entry_price: float, shares: float,
+                                   close_ts: float, window_open_price: float, crypto: str) -> dict:
+        """Places one real sell target and watches for BOTH the target hit
+        AND the stop-loss level, whichever comes first. Same bracket
+        philosophy as the original bot: the target rests as a real limit
+        order (safe, no slippage risk since it only fills at that exact
+        price); the stop-loss is a monitored trigger that only submits a
+        real sell the instant price actually crosses it, using the proven
+        guaranteed-exit escalation to handle slippage as well as possible."""
+        target_price = round(entry_price + SINGLE_SIDE_TARGET, 4)
+        stop_loss_price = round(entry_price - SINGLE_SIDE_STOP_LOSS, 4)
+        log(f"Target ${target_price} (+${SINGLE_SIDE_TARGET}) | Stop-loss ${stop_loss_price} "
+            f"(-${SINGLE_SIDE_STOP_LOSS})", crypto)
+
+        if not self.dry_run:
+            from py_clob_client_v2 import OrderArgsV2, Side, OrderType, OrderPayload
+            try:
+                resp = self.client.create_and_post_order(
+                    OrderArgsV2(token_id=token, price=target_price, size=shares, side=Side.SELL),
+                    order_type=OrderType.GTC)
+                order_id = resp.get("orderID", "")
+            except Exception as e:
+                log(f"⚠️ Could not place target sell: {e}", crypto)
+                order_id = None
+
+        while now_unix() < close_ts:
+            book = get_order_book(token)
+            bid, size = best_bid(book)
+
+            if self.dry_run:
+                if bid is not None and bid >= target_price and size >= shares:
+                    log(f"Target hit at ${target_price}", crypto)
+                    pnl = round((target_price - entry_price) * shares, 4)
+                    return {"outcome": "target_hit", "exit_price": target_price, "pnl_usd": pnl,
+                            "notes": "target sell hit"}
+                if bid is not None and bid <= stop_loss_price:
+                    exit_result = self._guaranteed_sell(token, shares, crypto)
+                    exit_price = exit_result["price"] if exit_result["price"] is not None else bid
+                    pnl = round((exit_price - entry_price) * shares, 4)
+                    log(f"Stop-loss hit, exited at ${exit_price}", crypto)
+                    return {"outcome": "stop_loss_hit", "exit_price": exit_price, "pnl_usd": pnl,
+                            "notes": f"stop-loss triggered (bid ${bid})"}
+            else:
+                if order_id:
+                    try:
+                        detail = self.client.get_order(order_id)
+                        if float(detail.get("size_matched", 0)) >= shares:
+                            log(f"Target hit at ${target_price}", crypto)
+                            pnl = round((target_price - entry_price) * shares, 4)
+                            return {"outcome": "target_hit", "exit_price": target_price, "pnl_usd": pnl,
+                                    "notes": "target sell hit"}
+                    except Exception:
+                        pass
+                if bid is not None and bid <= stop_loss_price:
+                    log(f"Stop-loss level reached (bid ${bid:.3f} <= ${stop_loss_price}) — "
+                        f"cancelling target and exiting now", crypto)
+                    from py_clob_client_v2 import OrderPayload
+                    if order_id:
+                        try:
+                            self.client.cancel_order(OrderPayload(orderID=order_id))
+                        except Exception:
+                            pass
+                        # Ghost-fill guard: the target could have filled in the race
+                        # window right as the cancel took effect — check before
+                        # assuming we still need to sell.
+                        try:
+                            tp_detail = self.client.get_order(order_id)
+                            if float(tp_detail.get("size_matched", 0)) >= shares:
+                                log("Target actually filled in the race window before the cancel — "
+                                    "treating as a target win, not selling again", crypto)
+                                pnl = round((target_price - entry_price) * shares, 4)
+                                return {"outcome": "target_hit", "exit_price": target_price, "pnl_usd": pnl,
+                                        "notes": "target hit (won the race against stop-loss detection)"}
+                        except Exception:
+                            pass
+                    exit_result = self._guaranteed_sell(token, shares, crypto)
+                    exit_price = exit_result["price"] if exit_result["price"] is not None else bid
+                    pnl = round((exit_price - entry_price) * shares, 4)
+                    return {"outcome": "stop_loss_hit", "exit_price": exit_price, "pnl_usd": pnl,
+                            "notes": f"stop-loss triggered"}
+
+            time.sleep(SINGLE_SIDE_POLL_INTERVAL)
+
+        # Window closed with neither target nor stop-loss triggered — cancel
+        # the resting order and determine the real resolution outcome.
+        if not self.dry_run and order_id:
+            from py_clob_client_v2 import OrderPayload
+            try:
+                self.client.cancel_order(OrderPayload(orderID=order_id))
+            except Exception:
+                pass
+
+        symbol = SYMBOLS.get(crypto)
+        final_price = get_binance_price(symbol)
+        up_won = (final_price is not None and window_open_price is not None and final_price > window_open_price)
+        this_side_won = up_won if side == "Up" else (not up_won)
+        resolve_price = 1.0 if this_side_won else 0.0
+        pnl = round((resolve_price - entry_price) * shares, 4)
+        log(f"Window closed, neither target nor stop-loss triggered — resolved to ${resolve_price} "
+            f"at settlement, pnl={'+' if pnl>=0 else ''}${pnl}", crypto)
+        return {"outcome": "resolved_no_target", "exit_price": resolve_price, "pnl_usd": pnl,
+                "notes": f"held to window close, resolved to ${resolve_price}"}
 
     # ── HEDGE MONITORING ─────────────────────────────────────────────────────
     def _place_and_monitor_hedge(self, market: dict, shares: float,
@@ -519,6 +806,73 @@ class HedgeBot:
                     "notes": f"Up sold at target, Down resolved to ${other_resolve} at settlement"}
 
     # ── WINDOW LOOP ──────────────────────────────────────────────────────────
+    def _monitor_window_single_side(self, slug_prefix: str, start_ts: int):
+        crypto = MARKETS[slug_prefix]
+        close_ts = start_ts + 300
+        symbol = SYMBOLS.get(crypto)
+
+        market = None
+        find_deadline = now_unix() + 5
+        while now_unix() < find_deadline:
+            market = get_window_market(slug_prefix, start_ts)
+            if market:
+                break
+            time.sleep(0.5)
+        if not market:
+            log(f"Could not find market for window starting {start_ts} — skipping", crypto)
+            return
+
+        window_open_price = get_window_open_price(symbol, start_ts) if symbol else None
+        if window_open_price:
+            log(f"Price to beat this window: ${window_open_price:,.2f}", crypto)
+        else:
+            log("Could not fetch price-to-beat — skipping entire window", crypto)
+            return
+
+        # Coin-flip: check both prices immediately, buy whichever side the
+        # market is ALREADY leaning toward right now — its own immediate
+        # pricing, not a signal we compute ourselves.
+        book_down = get_order_book(market["down_token"])
+        book_up = get_order_book(market["up_token"])
+        down_ask, _ = best_ask(book_down)
+        up_ask, _ = best_ask(book_up)
+        if down_ask is None or up_ask is None:
+            log("Could not get coin-flip prices — skipping window", crypto)
+            return
+
+        if down_ask > up_ask:
+            side_to_enter, token, observed_price = "Down", market["down_token"], down_ask
+        elif up_ask > down_ask:
+            side_to_enter, token, observed_price = "Up", market["up_token"], up_ask
+        else:
+            log(f"Coin-flip exactly even (Down=${down_ask}, Up=${up_ask}) — no lean to act on, skipping", crypto)
+            return
+
+        log(f"Coin-flip lean: Down ${down_ask} | Up ${up_ask} -> buying {side_to_enter} @ ~${observed_price}", crypto)
+        buy_result = self._attempt_single_buy(token, observed_price, crypto)
+        row = {
+            "timestamp": ts_str(), "mode": self.mode_str, "crypto": crypto, "slug": market["slug"],
+            "side": side_to_enter, "down_entry_price": down_ask, "up_entry_price": up_ask,
+            "buy_result": buy_result["result"], "entry_price": buy_result["price"],
+            "shares": buy_result["shares"],
+        }
+        if buy_result["result"] != "bought":
+            row.update({"outcome": "no_fill", "exit_price": "", "pnl_usd": 0, "notes": "buy did not fill"})
+            with self.trades_lock:
+                self.trades.append(row)
+            self.logger.write(row)
+            log(f"RECORDED: no_fill", crypto)
+            return
+
+        outcome = self._monitor_single_position(side_to_enter, token, buy_result["price"],
+                                                   buy_result["shares"], close_ts, window_open_price, crypto)
+        row.update(outcome)
+        with self.trades_lock:
+            self.trades.append(row)
+        self.logger.write(row)
+        sign = "+" if outcome["pnl_usd"] is not None and outcome["pnl_usd"] >= 0 else ""
+        log(f"RECORDED: {outcome['outcome']} | pnl={sign}${outcome['pnl_usd']}", crypto)
+
     def _monitor_window(self, slug_prefix: str, start_ts: int):
         crypto = MARKETS[slug_prefix]
         close_ts = start_ts + 300
@@ -616,7 +970,10 @@ class HedgeBot:
                 break
             log(f"Monitoring window starting {datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC", crypto)
             try:
-                self._monitor_window(slug_prefix, start_ts)
+                if STRATEGY_MODE == "leaning_side":
+                    self._monitor_window_single_side(slug_prefix, start_ts)
+                else:
+                    self._monitor_window(slug_prefix, start_ts)
             except Exception as e:
                 log(f"⚠️ Unhandled error this window: {e}", crypto)
             next_start_ts = start_ts + 300
