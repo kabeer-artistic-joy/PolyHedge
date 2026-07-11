@@ -61,18 +61,22 @@ BINANCE_API = "https://api.binance.com"
 SYMBOLS = {"BTC": "BTCUSDT"}
 MARKETS = {"btc-updown-5m": "BTC"}
 
-SPLIT_AMOUNT_USD = 2.0          # $ split into equal Up+Down shares per entry
-SELL_TARGET_PER_SHARE = 0.05    # sell target above each leg's entry price
+SPLIT_AMOUNT_USD = 10.0         # $ split into equal Up+Down shares per entry — raised from $2 for this test
+SELL_TARGET_PER_SHARE = 0.02    # sell target above each leg's entry price — tightened from $0.05 for this test
 
-MAX_DELTA_TO_ENTER = 10.0       # skip entirely if |BTC price - price-to-beat| exceeds this —
-                                  # a strong persistent trend is the outcome-B danger zone
+COIN_FLIP_MODE = True          # NEW TEST VARIANT: enter immediately at window start, skipping the
+                                  # choppiness/delta signal entirely. Set to False to go back to the
+                                  # gated-entry approach (kept intact below, not deleted, for comparison).
 
-CHOPPINESS_LOOKBACK_SEC = 45    # rolling window for the churn-detection signal
-CHOPPINESS_RATIO_THRESHOLD = 2.5  # path_length / net_displacement must exceed this to enter —
-                                     # starting guess, meant to be refined against real dry-run data,
-                                     # not assumed correct in advance
+MAX_DELTA_TO_ENTER = 10.0       # only used when COIN_FLIP_MODE is False — skip entirely if
+                                  # |BTC price - price-to-beat| exceeds this
 
-MAX_ENTRIES_PER_WINDOW = 4      # cap, not a mandate — depends on real conditions
+CHOPPINESS_LOOKBACK_SEC = 45    # only used when COIN_FLIP_MODE is False — rolling window for the
+                                  # churn-detection signal
+CHOPPINESS_RATIO_THRESHOLD = 2.5  # only used when COIN_FLIP_MODE is False
+
+MAX_ENTRIES_PER_WINDOW = 1      # lowered from 4 — one coin-flip entry per window, wait the full
+                                  # window, no re-entries for this test
 MONITOR_INTERVAL = 1.0
 POLL_INTERVAL_LEG = 0.5         # how often to check each resting sell leg for a fill
 
@@ -337,6 +341,8 @@ class HedgeBot:
 
     # ── ENTRY SIGNAL ─────────────────────────────────────────────────────────
     def _should_enter(self, delta_from_beat: float, choppiness) -> bool:
+        if COIN_FLIP_MODE:
+            return True  # enter immediately, no signal gating — this test variant
         if abs(delta_from_beat) >= MAX_DELTA_TO_ENTER:
             return False  # strong persistent trend — the outcome-B danger zone
         if choppiness is None or choppiness < CHOPPINESS_RATIO_THRESHOLD:
